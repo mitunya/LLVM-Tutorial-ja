@@ -1,0 +1,43 @@
+https://misohena.jp/blog/2020-12-12-how-to-escape-symbols-in-org-mode.html
+org-modeで文字をエスケープする方法
+
+
+記号	entity	使われているところ(マニュアルの該当箇所)
+[	 	timestamp, link, image, foot note, priority, subtask fraction, checkbox
+<	lt	timestamp, link target, column group, column width
+>	gt	column group
+|	vert	table
+#	 	comment, block, meta, table row
+\	 	latex, line break, entity
+.	 	list
+$	dollar	latex, table row
+:	colon	drawers, property, fixed-width area, tag, list
+–	 	list, horizontal line
+^	asciicirc	superscript, table row
+@	 	export snippets
+{	 	macro
+*	star	bold, headline, list, table row
+/	slash	italic, table row
+_	under	underline, subscript, table row
++	plus	strike through, list, table.el
+=	equal	verbatim, table formula
+~	tilde	code
+!	 	table row
+%	 	agenda
+,	 	block
+
+何かで包む
+~(code) や =(verbatim)
+
+ex:
+~\under{}~
+
+#+begin_example
+
+
+オプション指定	意味
+#+OPTIONS: ^:nil	a^b a_b を変換しない
+#+OPTIONS: ^:{}	a^{b} a_{b} の書き方のみ許容
+#+OPTIONS: *:nil	*word* _word_ /word/ +word+ を変換しない
+#+OPTIONS: -:nil	\- -- --- ... を変換しない
+#+OPTIONS: tex:verbatim	\begin $ 等のTeX表記を変換しない

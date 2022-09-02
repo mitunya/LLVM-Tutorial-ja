@@ -1,0 +1,159 @@
+# -*- mode: org; -*-
+
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://fniessen.github.io/org-html-themes/src/readtheorg_theme/css/htmlize.css"/>
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://fniessen.github.io/org-html-themes/src/readtheorg_theme/css/readtheorg.css"/>
+
+#+HTML_HEAD: <script src="https://ajax.googleapis.com/ajax/libs/jquery/2.1.3/jquery.min.js"></script>
+#+HTML_HEAD: <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.4/js/bootstrap.min.js"></script>
+#+HTML_HEAD: <script type="text/javascript" src="https://fniessen.github.io/org-html-themes/src/lib/js/jquery.stickytableheaders.min.js"></script>
+#+HTML_HEAD: <script type="text/javascript" src="https://fniessen.github.io/org-html-themes/src/readtheorg_theme/js/readtheorg.js"></script>
+
+# export theme
+# https://github.com/fniessen/org-html-themes/blob/master/org/theme-readtheorg.setup
+# https://github.com/fniessen/org-html-themes
+
+#+STARTUP: showeverything
+#+OPTIONS: num:nil
+
+[[https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl01.html]]
+
+* 1 Kaleidoscope: Kaleidoscope Introduction and the Lexer
+
+** 1.1 The Kaleidoscope Language
+
+このチュートリアルは、「[[http://en.wikipedia.org/wiki/Kaleidoscope][カレイドスコープ]]」（「美しい、形、眺めの意味」に由来）というおもちゃの言語を使って説明されています。 Kaleidoscopeは手続き型言語で、関数の定義、条件分岐、数学などを使用することができます。 このチュートリアルでは、Kaleidoscopeを拡張して、if/then/else構造、forループ、ユーザ定義演算子、簡単なコマンドラインインタフェースを使ったJITコンパイル、デバッグ情報などをサポートするようにします。
+
+私たちは、物事をシンプルに考えたいので、Kaleidoscopeのデータ型は64ビット浮動小数点型（C言語の用語では「double」）だけにしています。 そのため、すべての値は暗黙のうちに倍精度であり、この言語では型宣言は必要ありません。 このため、この言語には非常に優れたシンプルな構文が備わっています。
+例えば，次のような簡単な例で[[http://en.wikipedia.org/wiki/Fibonacci_number][フィボナッチ数]]を計算することができます．
+
+#+begin_src
+# Compute the x'th fibonacci number.
+def fib(x)
+  if x < 3 then
+    1
+  else
+    fib(x-1)+fib(x-2)
+
+# This expression will compute the 40th number.
+fib(40)
+#+end_src
+
+また、Kaleidoscopeは、標準ライブラリ関数を呼び出すことができます。 LLVM JITは、これをとても簡単にしてくれます。 つまり、'extern'キーワードを使って、使う前に関数を定義することができます（これは、相互に再帰的な関数の場合にも便利です）。
+
+例えば:
+#+begin_src
+extern sin(arg);
+extern cos(arg);
+extern atan2(arg1 arg2);
+
+atan2(sin(.4), cos(42))
+#+end_src
+
+第6章では、[[https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl06.html#kicking-the-tires][マンデルブロー集合]]を様々な倍率で表示する小さな万華鏡アプリケーションを紹介します。
+
+では、この言語の実装に飛び込んでみましょう!
+
+** 1.2 The Lexer
+
+言語を実装する場合、まず必要なのはテキストファイルを処理し、その内容を認識する能力である。 これを行う従来の方法は、「[[http://en.wikipedia.org/wiki/Lexical_analysis][レキサー]]」（別名「スキャナー」）を使って入力を「トークン」に分割することである。 レキサーが返す各トークンには、トークン・コードと、潜在的にいくつかのメタデータ（例えば数値）が含まれる。
+まず、可能性を定義する。
+
+#+begin_src
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5,
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+#+end_src
+
+レキサーが返す各トークンは、Token列挙型の値のいずれかであるか、あるいは '+' のような 'unknown' 文字であり、そのASCII値として返されるかのいずれかです。現在のトークンが識別子の場合、IdentifierStrグローバル変数にその識別子の名前が格納されます。もし現在のトークンが数値リテラル（1.0など）であれば、NumValがその値を保持する。ここでは、簡単のためにグローバル変数を使用しているが、実際の言語実装では、これは最良の選択ではない :) 。
+
+レキサーの実際の実装は、gettokという名前の1つの関数です。 gettok関数は、標準入力から次のトークンを返すために呼び出されます。 その定義は次のように始まる。
+
+#+begin_src
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = ' ';
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+#+end_src
+
+gettok は C の getchar() 関数を呼び出して標準入力から文字を一文字ずつ読み込むことで動作します。 文字を認識するとそれを処理し、最後に読み込んだが処理されなかった文字を LastChar に格納します。 最初にしなければならないことは、トークン間の空白を無視することです。 これは上のループで実現されている。
+
+次にgettokがすべきことは、識別子と "def "のような特定のキーワードを認識することです。 Kaleidoscopeはこれを次のような単純なループで行っています。
+
+#+begin_src
+if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+  IdentifierStr = LastChar;
+  while (isalnum((LastChar = getchar())))
+    IdentifierStr += LastChar;
+
+  if (IdentifierStr == "def")
+    return tok_def;
+  if (IdentifierStr == "extern")
+    return tok_extern;
+  return tok_identifier;
+}
+#+end_src
+
+このコードでは，識別子をレキシングするたびに 'IdentifierStr' グローバルをセットしていることに注意してください。 また、言語キーワードも同じループでマッチングされるため、ここではインラインで処理しています。数値も同様です。
+
+#+begin_src
+if (isdigit(LastChar) || LastChar == '.') {   // Number: [0-9.]+
+  std::string NumStr;
+  do {
+    NumStr += LastChar;
+    LastChar = getchar();
+  } while (isdigit(LastChar) || LastChar == '.');
+
+  NumVal = strtod(NumStr.c_str(), 0);
+  return tok_number;
+}
+#+end_src
+
+これはすべて、入力を処理するための非常に単純なコードである。 入力から数値を読み取るときは、C の strtod 関数を使って数値に変換し、NumVal に格納する。 これは十分なエラーチェックを行っていないことに注意。"1.23.45.67 "を間違って読み、"1.23 "と入力したかのように処理する。 自由に拡張してください。 次に、コメントを処理します。
+
+#+begin_src
+if (LastChar == '#') {
+  // Comment until end of line.
+  do
+    LastChar = getchar();
+  while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
+
+  if (LastChar != EOF)
+    return gettok();
+}
+#+end_src
+
+コメントは行末までスキップして処理し、次のトークンを返す。最後に、入力が上記のケースのいずれにもマッチしない場合、それは'+'のような演算子文字か、ファイルの終端である。 これらはこのコードで処理される。
+
+#+begin_src
+  // Check for end of file.  Don't eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+#+end_src
+
+これで、基本的なKaleidoscope言語の完全なレキサができました（レキサの完全な[[https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html#full-code-listing][コードリスト]]は、チュートリアルの[[https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html][次の章]]にあります）。 次に、これを用いて[[https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html][抽象構文木]]を構築する簡単なパーサーを作成します。 それができたら、レキサーとパーサーを一緒に使えるように、ドライバを同梱する予定です。
+
+[[LangImpl02-ja.html][Next: Implementing a Parser and AST]]
+
+# ends here

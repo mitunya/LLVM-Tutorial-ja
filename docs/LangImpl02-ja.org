@@ -1,0 +1,989 @@
+# -*- mode: org; -*-
+
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://fniessen.github.io/org-html-themes/src/readtheorg_theme/css/htmlize.css"/>
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://fniessen.github.io/org-html-themes/src/readtheorg_theme/css/readtheorg.css"/>
+
+#+HTML_HEAD: <script src="https://ajax.googleapis.com/ajax/libs/jquery/2.1.3/jquery.min.js"></script>
+#+HTML_HEAD: <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.4/js/bootstrap.min.js"></script>
+#+HTML_HEAD: <script type="text/javascript" src="https://fniessen.github.io/org-html-themes/src/lib/js/jquery.stickytableheaders.min.js"></script>
+#+HTML_HEAD: <script type="text/javascript" src="https://fniessen.github.io/org-html-themes/src/readtheorg_theme/js/readtheorg.js"></script>
+
+# export theme
+# https://github.com/fniessen/org-html-themes/blob/master/org/theme-readtheorg.setup
+# https://github.com/fniessen/org-html-themes
+
+#+STARTUP: showeverything
+#+OPTIONS: num:nil
+
+[[https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html]]
+
+* 2 Kaleidoscope: Implementing a Parser and AST
+
+** 2.1 Chapter 2 Introduction
+LLVMを使った言語の実装」チュートリアルの第2章へようこそ。この章では、第1章で構築したレキサを使用して、Kaleidoscope言語用の完全なパーサを構築する方法を説明します。パーサができたら、抽象構文木（AST）を定義して構築します。
+
+
+** 2.2 The Abstract Syntax Tree (AST)
+
+プログラムのASTは、コンパイラの後段（コード生成など）が解釈しやすいように、その動作をキャプチャするものである。基本的には、言語の各構成要素に対して1つのオブジェクトが必要であり、ASTは言語を忠実にモデル化する必要がある。Kaleidoscopeでは、式、プロトタイプ、そして関数オブジェクトがあります。まず、式から説明します。
+
+#+begin_src
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() {}
+};
+
+/// NumberExprAST - Expression class for numeric literals like "1.0".
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+};
+#+end_src
+
+上記のコードは基本的なExprASTクラスと数値リテラルに使用するサブクラスの定義を示したものです。このコードで重要なのは、NumberExprASTクラスがリテラルの数値をインスタンス変数として取り込んでいる点です。これにより、コンパイラの後のフェーズでは、格納されている数値が何であるかを知ることができます。
+
+今はASTを作成するだけなので、それに対する有用なアクセサメソッドはありません。例えば、コードをきれいに印刷するための仮想メソッドを追加するのは非常に簡単でしょう。以下は、Kaleidoscope言語の基本形で使用する他の式ASTノード定義です。
+
+#+begin_src
+/// VariableExprAST - Expression class for referencing a variable, like "a".
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &Name) : Name(Name) {}
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr<ExprAST> LHS, RHS;
+
+public:
+  BinaryExprAST(char op, std::unique_ptr<ExprAST> LHS,
+                std::unique_ptr<ExprAST> RHS)
+    : Op(op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector<std::unique_ptr<ExprAST>> Args;
+
+public:
+  CallExprAST(const std::string &Callee,
+              std::vector<std::unique_ptr<ExprAST>> Args)
+    : Callee(Callee), Args(std::move(Args)) {}
+};
+#+end_src
+
+変数には変数名、二項演算子にはオペコード（例えば'+'）、コールには関数名と引数式のリストが格納されます。このASTの良いところは、言語の文法について語ることなく、言語の特徴を捉えていることです。二項演算子の優先順位や字句の構造などについては議論されていないことに注意。
+
+私たちの基本的な言語では、これらはすべて定義する式節である。条件付き制御フローを持たないので、チューリング完全ではない。これは後の回で修正する。次に必要なのは、関数へのインターフェイスを語る方法と、関数そのものを語る方法です。
+
+#+begin_src
+/// PrototypeAST - This class represents the "prototype" for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes).
+class PrototypeAST {
+  std::string Name;
+  std::vector<std::string> Args;
+
+public:
+  PrototypeAST(const std::string &name, std::vector<std::string> Args)
+    : Name(name), Args(std::move(Args)) {}
+
+  const std::string &getName() const { return Name; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr<PrototypeAST> Proto;
+  std::unique_ptr<ExprAST> Body;
+
+public:
+  FunctionAST(std::unique_ptr<PrototypeAST> Proto,
+              std::unique_ptr<ExprAST> Body)
+    : Proto(std::move(Proto)), Body(std::move(Body)) {}
+};
+#+end_src
+
+Kaleidoscope では、関数は引数の数だけ型付けされます。すべての値は倍精度浮動小数点なので、各引数の型はどこにも保存する必要がありません。もっと積極的で現実的な言語では、「ExprAST」クラスはおそらく型フィールドを持つでしょう。
+
+この足場があれば、Kaleidoscopeで式と関数本体のパースについて話すことができます。
+
+** 2.3 Parser Basics
+
+構築するASTができたので、それを構築するためのパーサコードを定義する必要があります。ここでは、「x+y」のようなもの（レキサが3つのトークンとして返す）をパースして、次のような呼び出しで生成できるASTにしたい、という考えです。
+
+#+begin_src
+auto LHS = std::make_unique<VariableExprAST>("x");
+auto RHS = std::make_unique<VariableExprAST>("y");
+auto Result = std::make_unique<BinaryExprAST>('+', std::move(LHS),
+                                              std::move(RHS));
+#+end_src
+
+そのために、まず基本的なヘルパールーチンをいくつか定義しておきます。
+
+#+begin_src
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() {
+  return CurTok = gettok();
+}
+#+end_src
+
+これは、レキサーの周りに単純なトークンバッファーを実装しています。これにより、レキサが返してくるトークンを1つ先に見ることができます。パーサ内のすべての関数は、CurTok が解析が必要な現在のトークンであると仮定します。
+
+#+begin_src
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr<ExprAST> LogError(const char *Str) {
+  fprintf(stderr, "LogError: %s\n", Str);
+  return nullptr;
+}
+std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+#+end_src
+
+LogError ルーチンは、パーサーがエラーを処理するために使用する単純なヘルパー ルーチンです。このパーサーのエラー回復は最高ではありませんし、特に使いやすいものでもありませんが、このチュートリアルでは十分でしょう。これらのルーチンを使うと、さまざまな戻り値の型を持つルーチンのエラーを簡単に処理することができます。
+
+これらの基本的なヘルパー関数を使って、私たちの文法の最初の部分である数値リテラルを実装することができます。
+
+** 2.4 Basic Expression Parsing
+
+まず、数値リテラルから始めます。これは処理が最も簡単だからです。文法の各プロダクションに対して、そのプロダクションをパースする関数を定義します。数値リテラルには、次のような関数があります。
+
+#+begin_src
+/// numberexpr ::= number
+static std::unique_ptr<ExprAST> ParseNumberExpr() {
+  auto Result = std::make_unique<NumberExprAST>(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+#+end_src
+
+このルーチンは非常に単純で、現在のトークンがtok_numberトークンであるときに呼び出されることを想定しています。これは、現在の数値値を取り、NumberExprASTノードを作成し、レキサを次のトークンに進め、そして最後に返します。
+
+これにはいくつかの興味深い側面があります。最も重要な点は、このルーチンがプロダクションに対応するすべてのトークンを食べ、次のトークン（文法プロダクションの一部ではない）を準備したレキサバッファを返すという点です。これは再帰的降順パーサーではかなり標準的な方法です。よりよい例を挙げると、括弧演算子は次のように定義されています。
+
+#+begin_src
+/// parenexpr ::= '(' expression ')'
+static std::unique_ptr<ExprAST> ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != ')')
+    return LogError("expected ')'");
+  getNextToken(); // eat ).
+  return V;
+}
+#+end_src
+
+この関数は、パーサーに関する興味深い事柄を数多く示している。
+
+1) LogError ルーチンをどのように使用するかを示しています。呼び出されたとき、この関数は現在のトークンが '(' トークンであることを期待しますが、部分式を解析した後、 ')' が待機していない可能性があります。例えば、ユーザが "(4)" ではなく "(4 x)" と入力した場合、パーサはエラーを発するはずです。エラーが発生する可能性があるため、パーサーはエラーが発生したことを示す方法が必要です。このパーサーでは、エラーが発生すると NULL を返します。
+
+2) この関数のもう 1 つの興味深い点は、ParseExpression を呼び出して再帰性を使用していることです（ParseExpression が ParseParenExpr を呼び出せることは、すぐに分かるでしょう）。これは、再帰的な文法を扱うことができ、各作業を非常にシンプルに保つことができるため、強力なものです。括弧はASTノードの構築そのものを引き起こさないことに注意してください。このようにすることもできますが、括弧の最も重要な役割は、パーサーをガイドしてグループ化を行うことです。パーサーがASTを構築すると、括弧は不要になります。
+
+次に、変数参照と関数呼び出しの処理について簡単に説明します。
+
+#+begin_src
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier '(' expression* ')'
+static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken();  // eat identifier.
+
+  if (CurTok != '(') // Simple variable ref.
+    return std::make_unique<VariableExprAST>(IdName);
+
+  // Call.
+  getNextToken();  // eat (
+  std::vector<std::unique_ptr<ExprAST>> Args;
+  if (CurTok != ')') {
+    while (1) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == ')')
+        break;
+
+      if (CurTok != ',')
+        return LogError("Expected ')' or ',' in argument list");
+      getNextToken();
+    }
+  }
+
+  // Eat the ')'.
+  getNextToken();
+
+  return std::make_unique<CallExprAST>(IdName, std::move(Args));
+}
+#+end_src
+
+このルーチンは他のルーチンと同じスタイルに従います。(それは、現在のトークンが tok_identifier トークンである場合に呼ばれることを期待する)。また、再帰とエラー処理もある。このルーチンの興味深い点は、現在の識別子が単独の変数参照であるか、関数呼び出し式であるかを判断するために先読みを使用していることです。これは、識別子の後のトークンが'('トークンであるかどうかをチェックし、VariableExprASTまたはCallExprASTノードを適切に構築することで処理されます。
+
+これで、簡単な式解析ロジックがすべて揃ったので、それを1つのエントリポイントにまとめるヘルパー関数を定義することができます。このクラスの式を「一次」式と呼びますが、その理由はこのチュートリアルの後半でより明確になります。任意の一次式をパースするためには、それがどのような式であるかを判断する必要があります。
+
+#+begin_src
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+static std::unique_ptr<ExprAST> ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError("unknown token when expecting an expression");
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case '(':
+    return ParseParenExpr();
+  }
+}
+#+end_src
+
+この関数の定義を見たところで、なぜ様々な関数でCurTokの状態を想定できるのかが、より明らかになっただろう。これは、ルックアヘッドを使って、どの種類の式が検査されているかを判断し、それを関数呼び出しで解析している。
+
+さて、基本的な式が扱えるようになったので、次は2進数の式を扱う必要がある。これは少し複雑である。
+
+** 2.5 Binary Expression Parsing
+
+2 進表現はあいまいな場合が多いため、解析が非常に困難です。たとえば、「x+y*z」という文字列が与えられた場合、パーサーはこれを「(x+y)*z」または「x+(y*z)」として解析するかどうかを選択できます。数学の一般的な定義では、「*」（乗算）は「+」（加算）よりも優先順位が高いため、後者のパースが予想されます。
+
+これを処理する方法はたくさんありますが、エレガントで効率的な方法は、演算子優先構文解析を使用することです。この構文解析技術は、二項演算子の優先順位を利用して再帰性を誘導する。まず始めに、優先順位の表が必要である。
+
+#+begin_src
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map<char, int> BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it's a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec <= 0) return -1;
+  return TokPrec;
+}
+
+int main() {
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence['<'] = 10;
+  BinopPrecedence['+'] = 20;
+  BinopPrecedence['-'] = 20;
+  BinopPrecedence['*'] = 40;  // highest.
+  ...
+}
+#+end_src
+
+Kaleidoscopeの基本形では、4つの二項演算子のみをサポートします（勇敢で勇敢な読者の皆様により、これは当然拡張可能です）。GetTokPrecedence関数は、現在のトークンの優先順位を返し、トークンが二項演算子でない場合は-1を返します。マップがあることで新しい演算子を追加しやすく、またアルゴリズムが特定の演算子に依存しないことを明確にすることができます。しかし、マップを削除して GetTokPrecedence 関数で比較を行うことは十分に簡単でしょう。(あるいは、固定サイズの配列を使用すればよい）。
+
+上記のヘルパーが定義されたので、二項式の解析を始めることができます。演算子優先順位の解析の基本的な考え方は、あいまいな二項演算子を含む式を断片に分解することです。たとえば、「a+b+(c+d)*e*f+g」という式があるとします。演算子優先解析では、これを二項演算子で区切られた一次式の流れとして考えます。そのため、まず先頭の一次式「a」を解析し、次に[+, b] [+, (c+d)] [*, e] [*, f] および [+, g] のペアを見ます。括弧は一次式なので、二項式パーサーは(c+d)のようなネストした部分式を全く気にする必要がないことに注意してください。
+
+まず始めに、式は潜在的に一次式であり、その後に一連の [binop,primaryexpr] ペアが続きます。
+
+#+begin_src
+/// expression
+///   ::= primary binoprhs
+///
+static std::unique_ptr<ExprAST> ParseExpression() {
+  auto LHS = ParsePrimary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+#+end_src
+
+ParseBinOpRHSは、一連のペアを解析してくれる関数です。この関数は，優先順位と，これまでにパースされた部分の式へのポインタを受け取ります．x "は完全に有効な式であることに注意。このように、"binoprhs "は空であることも許され、その場合は渡された式を返します。上の例では、コードは "a "を表す式をParseBinOpRHSに渡し、現在のトークンは "+"です。
+
+ParseBinOpRHS に渡される優先順位値は、この関数が使用できる最小限の演算子の優先順位を表します。たとえば、現在のペア ストリームが [+, x] で、ParseBinOpRHS に優先度 40 が渡された場合、（'+' の優先度は 20 しかないため）トークンを消費することはありません。これを踏まえて、ParseBinOpRHSは次のように始まります。
+
+#+begin_src
+/// binoprhs
+///   ::= ('+' primary)*
+static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr<ExprAST> LHS) {
+  // If this is a binop, find its precedence.
+  while (1) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec < ExprPrec)
+      return LHS;
+#+end_src
+
+このコードは現在のトークンの優先順位を取得し、それが低すぎるかどうかをチェックする。無効なトークンの優先順位を-1と定義したので、このチェックはトークン・ストリームが二項演算子を使い果たしたときにペア・ストリームが終了することを暗黙のうちに知っています。このチェックが成功すれば、トークンは二項演算子であり、この式に含まれることがわかる。
+
+#+begin_src
+// Okay, we know this is a binop.
+int BinOp = CurTok;
+getNextToken();  // eat binop
+
+// Parse the primary expression after the binary operator.
+auto RHS = ParsePrimary();
+if (!RHS)
+  return nullptr;
+#+end_src
+
+このように、このコードは二項演算子を食べて（記憶して）、その後に続く一次式を解析します。これは全体のペアを構築し、その最初のものは実行例の[+, b]です。
+
+さて、式の左辺とRHSシーケンスの1つのペアをパースしたところで、式がどのように関連付けるかを決めなければなりません。具体的には、「(a+b) binop unparsed」または「a + (b binop unparsed)」が考えられます。これを決定するために、「binop」を先に見てその優先順位を決定し、BinOpの優先順位（この場合「+」である）と比較するのである。
+
+#+begin_src
+// If BinOp binds less tightly with RHS than the operator after RHS, let
+// the pending operator take RHS as its LHS.
+int NextPrec = GetTokPrecedence();
+if (TokPrec < NextPrec) {
+#+end_src
+
+RHS "の右側のBinopの優先順位が現在の演算子の優先順位より低いか等しい場合、括弧は"(a+b) binop ... "として関連することが分かる。この例では、現在の演算子が "\plus"で、次の演算子が"\plus"なので、両者の優先順位が同じであることがわかります。この場合、「a+b」のASTノードを作成し、パージングを続行します。
+
+#+begin_src
+      ... if body omitted ...
+    }
+
+    // Merge LHS/RHS.
+    LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS),
+                                           std::move(RHS));
+  }  // loop around to the top of the while loop.
+}
+#+end_src
+
+上の例では、「a+b+」を「(a+b)」に変換し、「+」を現在のトークンとしてループの次の反復を実行する。上記のコードは、「(c+d)」を一次式として記憶し、解析し、現在のペアを[+, (c+d)] に等しくする。そして、上記の「if」条件を「*」を一次式の右側のバイノップとして評価する。この場合、「*」の優先順位は「+」の優先順位より高いので、if条件が入力されることになる。
+
+ここで残された重大な問題は、「if条件で右辺を完全に解析するにはどうすればいいか」ということだ。特に、今回の例でASTを正しく構築するためには、RHSの式変数として「(c+d)*e*f」をすべて取得する必要がある。これを行うためのコードは驚くほど簡単である（文脈のために上の2つのブロックのコードを重複させている）。
+
+#+begin_src
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec < NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec+1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+    // Merge LHS/RHS.
+    LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS),
+                                           std::move(RHS));
+  }  // loop around to the top of the while loop.
+}
+#+end_src
+
+この時点で、一次の右辺にある二項演算子は、現在解析している二項演算子よりも高い優先順位を持っていることがわかります。したがって、演算子がすべて「+」よりも高い優先順位のペアのシーケンスは、一緒に解析されて「RHS」として返されるべきであることが分かっています。これを行うには、ParseBinOpRHS関数を再帰的に起動し、継続するために必要な最小の優先順位として「TokPrec+1」を指定します。上の例では、これにより「(c+d)*e*f」のASTノードがRHSとして返され、それが「+」式のRHSとして設定される。
+
+最後に、whileループの次の繰り返しで、「+g」部分が解析され、ASTに追加される。このわずかなコード（自明ではない14行）で、非常にエレガントな方法で完全に一般的なバイナリ式のパージングを正しく処理することができるのです。これはこのコードの旋風ツアーであり、やや微妙なところです。このコードがどのように動作するかを確認するために、いくつかの厳しい例でそれを実行することをお勧めします。
+
+これで式の処理は一段落です。この時点で、パーサーを任意のトークンストリームに向け、そこから式を構築し、式の一部でない最初のトークンで停止させることができます。次は、関数定義などを処理する必要があります。
+
+** 2.6 Parsing the Rest
+
+次に足りないのは、関数プロトタイプの処理です。Kaleidoscopeでは、プロトタイプは「外部」関数宣言と関数本体定義の両方に使用されます。これを行うためのコードは単純で、あまり面白いものではありません（一旦、式を克服してしまえば）。
+
+#+begin_src
+/// prototype
+///   ::= id '(' id* ')'
+static std::unique_ptr<PrototypeAST> ParsePrototype() {
+  if (CurTok != tok_identifier)
+    return LogErrorP("Expected function name in prototype");
+
+  std::string FnName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != '(')
+    return LogErrorP("Expected '(' in prototype");
+
+  // Read the list of argument names.
+  std::vector<std::string> ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != ')')
+    return LogErrorP("Expected ')' in prototype");
+
+  // success.
+  getNextToken();  // eat ')'.
+
+  return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames));
+}
+#+end_src
+
+そう考えると、関数の定義は非常にシンプルで、プロトタイプと本体を実装する式だけである。
+
+#+begin_src
+/// definition ::= 'def' prototype expression
+static std::unique_ptr<FunctionAST> ParseDefinition() {
+  getNextToken();  // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto) return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+  return nullptr;
+}
+#+end_src
+
+さらに、'sin' や 'cos' といった関数の宣言や、ユーザー関数の前方宣言をサポートするために 'extern' をサポートしています。これらの 'extern' は単なるプロトタイプであり、ボディを持たない。
+
+#+begin_src
+/// external ::= 'extern' prototype
+static std::unique_ptr<PrototypeAST> ParseExtern() {
+  getNextToken();  // eat extern.
+  return ParsePrototype();
+}
+#+end_src
+
+最後に、ユーザが任意のトップレベル式を入力し、それをその場で評価することもできるようにします。この場合、無名nullary（引数ゼロ）関数を定義することで対応する。
+
+#+begin_src
+/// toplevelexpr ::= expression
+static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+    return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+#+end_src
+
+さて、これですべてのピースが揃ったので、実際に作ったコードを実行するための小さなドライバを作りましょう!
+
+
+** 2.7 The Driver
+
+このドライバは単純にトップレベルのディスパッチループですべてのパース部分を呼び出しています。ここではあまり面白いものはないので、トップレベルのループだけを載せておきます。トップレベルのパージング」セクションの全コードは以下を参照してください。
+
+#+begin_src
+/// top ::= definition | external | expression | ';'
+static void MainLoop() {
+  while (1) {
+    fprintf(stderr, "ready> ");
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case ';': // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+#+end_src
+
+この中で最も興味深いのは、トップレベルのセミコロンを無視することです。なぜそうするのか、とお聞きになったでしょうか。基本的な理由は、コマンドラインで「4 + 5」とタイプした場合、パーサーはそれがこれからタイプするものの終わりなのかそうでないのかを知らないからです。たとえば、次の行で「def foo...」と入力すれば、4＋5がトップレベル式の終わりとなります。また、"* 6 "と入力すれば、式が継続される。トップレベルのセミコロンがあれば、「4+5;」と入力すれば、パーサーはそれが終了したことを認識できます。
+
+
+** 2.8 Conclusions
+
+400行弱のコメント付きコード（240行の非コメント、非空白コード）で、レキサー、パーサー、ASTビルダーを含む最小限の言語が完全に定義されました。これが済めば、実行ファイルはKaleidoscopeのコードを検証し、それが文法的に無効かどうかを教えてくれます。例えば、次のような対話の例があります。
+
+#+begin_src
+$ ./a.out
+ready> def foo(x y) x+foo(y, 4.0);
+Parsed a function definition.
+ready> def foo(x y) x+y y;
+Parsed a function definition.
+Parsed a top-level expr
+ready> def foo(x y) x+y );
+Parsed a function definition.
+Error: unknown token when expecting an expression
+ready> extern sin(a);
+ready> Parsed an extern
+ready> ^D
+$
+#+end_src
+
+ここには、拡張の余地がたくさんある。新しいASTノードを定義したり、いろいろな方法で言語を拡張したりすることができます。次回は、ASTからLLVM中間表現(IR)を生成する方法について説明します。
+
+
+** 2.9 Full Code Listing
+
+以下は、この実行例の完全なコードリストです。LLVMライブラリを使用しているので、それらをリンクする必要があります。これを行うには、llvm-configツールを使って、makefileやコマンドラインにどのオプションを使用するかを知らせます。
+
+#+begin_src
+# Compile
+clang++ -g -O3 toy.cpp `llvm-config --cxxflags`
+# Run
+./a.out
+#+end_src
+
+以下はそのコードです。
+
+#+begin_src
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = ' ';
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == "def")
+      return tok_def;
+    if (IdentifierStr == "extern")
+      return tok_extern;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == '.') { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == '.');
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == '#') {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don't eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+};
+
+/// NumberExprAST - Expression class for numeric literals like "1.0".
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like "a".
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &Name) : Name(Name) {}
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr<ExprAST> LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
+                std::unique_ptr<ExprAST> RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector<std::unique_ptr<ExprAST>> Args;
+
+public:
+  CallExprAST(const std::string &Callee,
+              std::vector<std::unique_ptr<ExprAST>> Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+};
+
+/// PrototypeAST - This class represents the "prototype" for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes).
+class PrototypeAST {
+  std::string Name;
+  std::vector<std::string> Args;
+
+public:
+  PrototypeAST(const std::string &Name, std::vector<std::string> Args)
+      : Name(Name), Args(std::move(Args)) {}
+
+  const std::string &getName() const { return Name; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr<PrototypeAST> Proto;
+  std::unique_ptr<ExprAST> Body;
+
+public:
+  FunctionAST(std::unique_ptr<PrototypeAST> Proto,
+              std::unique_ptr<ExprAST> Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map<char, int> BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it's a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec <= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr<ExprAST> LogError(const char *Str) {
+  fprintf(stderr, "Error: %s\n", Str);
+  return nullptr;
+}
+std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr<ExprAST> ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr<ExprAST> ParseNumberExpr() {
+  auto Result = std::make_unique<NumberExprAST>(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= '(' expression ')'
+static std::unique_ptr<ExprAST> ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != ')')
+    return LogError("expected ')'");
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier '(' expression* ')'
+static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != '(') // Simple variable ref.
+    return std::make_unique<VariableExprAST>(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector<std::unique_ptr<ExprAST>> Args;
+  if (CurTok != ')') {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == ')')
+        break;
+
+      if (CurTok != ',')
+        return LogError("Expected ')' or ',' in argument list");
+      getNextToken();
+    }
+  }
+
+  // Eat the ')'.
+  getNextToken();
+
+  return std::make_unique<CallExprAST>(IdName, std::move(Args));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+static std::unique_ptr<ExprAST> ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError("unknown token when expecting an expression");
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case '(':
+    return ParseParenExpr();
+  }
+}
+
+/// binoprhs
+///   ::= ('+' primary)*
+static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr<ExprAST> LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec < ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the primary expression after the binary operator.
+    auto RHS = ParsePrimary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec < NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= primary binoprhs
+///
+static std::unique_ptr<ExprAST> ParseExpression() {
+  auto LHS = ParsePrimary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id '(' id* ')'
+static std::unique_ptr<PrototypeAST> ParsePrototype() {
+  if (CurTok != tok_identifier)
+    return LogErrorP("Expected function name in prototype");
+
+  std::string FnName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != '(')
+    return LogErrorP("Expected '(' in prototype");
+
+  std::vector<std::string> ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != ')')
+    return LogErrorP("Expected ')' in prototype");
+
+  // success.
+  getNextToken(); // eat ')'.
+
+  return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames));
+}
+
+/// definition ::= 'def' prototype expression
+static std::unique_ptr<FunctionAST> ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr",
+                                                std::vector<std::string>());
+    return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= 'extern' prototype
+static std::unique_ptr<PrototypeAST> ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing
+//===----------------------------------------------------------------------===//
+
+static void HandleDefinition() {
+  if (ParseDefinition()) {
+    fprintf(stderr, "Parsed a function definition.\n");
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (ParseExtern()) {
+    fprintf(stderr, "Parsed an extern\n");
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (ParseTopLevelExpr()) {
+    fprintf(stderr, "Parsed a top-level expr\n");
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | ';'
+static void MainLoop() {
+  while (true) {
+    fprintf(stderr, "ready> ");
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case ';': // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence['<'] = 10;
+  BinopPrecedence['+'] = 20;
+  BinopPrecedence['-'] = 20;
+  BinopPrecedence['*'] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, "ready> ");
+  getNextToken();
+
+  // Run the main "interpreter loop" now.
+  MainLoop();
+
+  return 0;
+}
+#+end_src
+
+Next: Implementing Code Generation to LLVM IR
+
+# ends here
